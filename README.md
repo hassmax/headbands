@@ -14,18 +14,28 @@ A party game for phones. Each player holds their phone up to their forehead, sho
 
 The host can add more words mid-game.
 
-## Run it
+## Play online
+
+**https://hassmax.github.io/headbands/** (deployed by GitHub Pages from `main`)
+
+There's no game server. The host's phone runs the room, so **the host should keep the page open**. Other phones connect straight to it over WebRTC, using [PeerJS](https://peerjs.com)'s free public broker to find each other. If anyone refreshes or briefly loses signal, they reconnect to the same room automatically.
+
+## Run it locally
 
 Needs Node 18 or newer. There are no dependencies.
 
 ```bash
 npm start            # http://localhost:3000
-PORT=8080 npm start  # different port
 ```
 
-To play with phones on the same Wi-Fi, open `http://<your-computer-ip>:3000` on each phone. To play over the internet, deploy to any Node host (Render, Railway, Fly.io, etc.). Phones need **HTTPS** for tilt controls and full screen; tapping works everywhere.
+Phones still need internet access to find each other. Tilt controls and full screen need HTTPS, which GitHub Pages provides; tapping works everywhere.
 
-## How it works
+## Deploying
 
-- `server.js` is a plain Node HTTP server. Rooms are stored in memory and dropped after 6 hours idle. Live updates go out over Server-Sent Events, and actions come in as `POST /api/action`.
-- `public/index.html` is the whole client in one file: no build step and no framework.
+`.github/workflows/pages.yml` publishes the `public/` folder to GitHub Pages on every push to `main`. One-time setup: **Settings → Pages → Build and deployment → Source: GitHub Actions**. `public/` is plain static files, so any static host (Netlify, Cloudflare Pages, Vercel) also works.
+
+## Files
+
+- `public/index.html`: the whole game: UI, host room logic, and peer connections.
+- `public/peerjs.min.js`: PeerJS 1.5.4, a vendored copy (MIT license).
+- `server.js`: tiny static file server for local testing.

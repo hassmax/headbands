@@ -53,6 +53,7 @@
 </head>
 <body>
 <main>
+  <div id="connStatus" class="hidden" style="background:#ff9f1a;color:#1b1033;font-weight:700;padding:10px 14px;border-radius:12px;margin-bottom:12px;text-align:center"></div>
   <!-- HOME -->
   <section id="home">
     <h1>Head<span>bands</span></h1>
@@ -92,6 +93,7 @@
       <div class="muted">Room code</div>
       <div class="code" id="roomCode"></div>
       <div class="muted" id="roomStatus"></div>
+      <div class="muted hidden" id="hostNote" style="margin-top:6px">You're the host — your phone runs the room, so keep this page open.</div>
       <button class="small ghost" id="shareBtn" style="margin-top:10px">Share invite link</button>
     </div>
 
@@ -127,8 +129,13 @@
   <button id="fhExit">✕ Exit</button>
 </div>
 
+<script src="peerjs.min.js"></script>
 <script>
+// Headbands runs with no server of its own. The host's browser keeps the room;
+// other phones connect straight to it over WebRTC. PeerJS's free public
+// broker only introduces the phones to each other.
 const $ = (id) => document.getElementById(id);
+const PEER_PREFIX = 'headbands-v1-';
 const PACKS = {
   'Celebrities': ['Taylor Swift','Beyoncé','Elon Musk','Oprah Winfrey','Lionel Messi','Rihanna','Dwayne Johnson','Barack Obama','Kim Kardashian','LeBron James','Lady Gaga','Tom Hanks','Serena Williams','Shakira','Keanu Reeves','Adele','Cristiano Ronaldo','Zendaya','Drake','Bad Bunny'],
   'Historical': ['Albert Einstein','Cleopatra','Napoleon','Abraham Lincoln','Leonardo da Vinci','Marie Curie','Gandhi','Julius Caesar','Shakespeare','Queen Elizabeth I','Martin Luther King Jr.','Genghis Khan','Isaac Newton','Frida Kahlo','Nelson Mandela','Amelia Earhart'],
@@ -137,26 +144,219 @@ const PACKS = {
   'Things': ['Toaster','Umbrella','Volcano','Pizza','Bicycle','Lighthouse','Rubber Duck','Smartphone','Snowman','Rollercoaster','Treadmill','Cactus','Disco Ball','Submarine'],
 };
 
-let session = null; // {code, playerId}
-let state = null;
-let es = null;
+let session = null; // {code, playerId, name, host}
+let state = null;   // the view of the room this phone renders
+let peer = null;
+let hostConn = null; // guests: connection to the host
+let room = null;     // host only: the authoritative room
+const conns = new Map(); // host only: playerId -> connection
 
+const rid = () => Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+const randInt = (n) => Math.floor(Math.random() * n);
+const clean = (s, max = 40) => String(s || '').trim().slice(0, max);
+function parseList(t) {
+  const list = Array.isArray(t) ? t : String(t || '').split(/[\n,]+/);
+  return [...new Set(list.map((w) => clean(w, 60)).filter(Boolean))].slice(0, 500);
+}
 function show(id) { for (const s of ['home','create','room']) $(s).classList.toggle('hidden', s !== id); }
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function parseList(t) { return [...new Set(t.split(/[\n,]+/).map((w) => w.trim()).filter(Boolean))]; }
+function store(kind, key, val) { try { val === undefined ? window[kind].removeItem(key) : window[kind].setItem(key, JSON.stringify(val)); } catch {} }
+function load(kind, key) { try { return JSON.parse(window[kind].getItem(key) || 'null'); } catch { return null; } }
 
-async function api(path, body) {
-  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || 'Something went wrong');
-  return data;
+function setStatusLine(msg) { $('connStatus').textContent = msg || ''; $('connStatus').classList.toggle('hidden', !msg); }
+
+// ---------------- Host: game engine ----------------
+function draw() { return room.deck.length ? room.deck.splice(randInt(room.deck.length), 1)[0] : null; }
+function addPlayer(name, id = rid()) {
+  const p = { id, name: clean(name, 24) || 'Player', score: 0, word: null, guessed: [] };
+  room.players.push(p);
+  if (room.status === 'playing') p.word = draw();
+  return p;
 }
-const act = (type, extra = {}) => api('/api/action', { ...session, type, ...extra }).catch((e) => alert(e.message));
+const findPlayer = (id) => room.players.find((p) => p.id === id);
 
-// ---------- Home / create / join ----------
-const saved = (() => { try { return JSON.parse(localStorage.getItem('hb') || '{}'); } catch { return {}; } })();
-const save = (o) => { try { localStorage.setItem('hb', JSON.stringify({ ...saved, ...o })); } catch {} };
-$('joinName').value = $('hostName').value = saved.name || '';
+function viewFor(playerId) {
+  return {
+    code: room.code, status: room.status, you: playerId, hostId: room.hostId,
+    wordsLeft: room.deck.length, totalWords: room.words.length,
+    players: room.players.map((p) => ({ ...p, online: p.id === room.hostId || !!conns.get(p.id)?.open })),
+  };
+}
+function broadcast() {
+  store('localStorage', 'hbRoom', room);
+  for (const [pid, c] of conns) if (c.open) c.send({ t: 'state', state: viewFor(pid) });
+  state = viewFor(room.hostId);
+  render();
+}
+
+function applyAction(player, a) {
+  const isHost = player.id === room.hostId;
+  const hostOnly = () => { if (!isHost) throw new Error('Only the host can do that'); };
+  switch (a.type) {
+    case 'start':
+      hostOnly();
+      room.deck = [...room.words];
+      room.status = 'playing';
+      for (const p of room.players) { p.score = 0; p.guessed = []; p.word = draw(); }
+      break;
+    case 'correct':
+    case 'pass': {
+      if (room.status !== 'playing' || !player.word) break;
+      const old = player.word;
+      if (a.type === 'correct') { player.score++; player.guessed.push(old); }
+      player.word = draw();
+      if (a.type === 'pass') room.deck.push(old);
+      break;
+    }
+    case 'addWords':
+      hostOnly();
+      for (const w of parseList(a.words)) {
+        if (!room.words.includes(w)) { room.words.push(w); if (room.status === 'playing') room.deck.push(w); }
+      }
+      if (room.status === 'playing') for (const p of room.players) if (!p.word) p.word = draw();
+      break;
+    case 'end': hostOnly(); room.status = 'ended'; break;
+    case 'lobby': hostOnly(); room.status = 'lobby'; for (const p of room.players) p.word = null; break;
+    case 'kick': {
+      hostOnly();
+      const p = findPlayer(a.playerId);
+      if (!p || p.id === room.hostId) break;
+      if (p.word) room.deck.push(p.word);
+      room.players = room.players.filter((x) => x !== p);
+      const c = conns.get(p.id); conns.delete(p.id);
+      if (c?.open) { c.send({ t: 'kicked' }); setTimeout(() => c.close(), 300); }
+      break;
+    }
+    case 'leave':
+      if (player.word && room.status === 'playing') room.deck.push(player.word);
+      room.players = room.players.filter((x) => x !== player);
+      conns.get(player.id)?.close(); conns.delete(player.id);
+      break;
+    default: throw new Error('Unknown action');
+  }
+  broadcast();
+}
+
+const newCode = () => Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[randInt(24)]).join('');
+
+// Claim the room code on the PeerJS broker and start serving the room.
+// isNew: a fresh room picks another code if this one is taken; a resumed room
+// (after the host refreshed) waits for its old registration to expire.
+function startHosting(r, isNew, tries = 0) {
+  peer = new Peer(PEER_PREFIX + r.code);
+  peer.on('open', () => {
+    setStatusLine('');
+    room = r;
+    session = { code: room.code, playerId: room.hostId, name: findPlayer(room.hostId)?.name, host: true };
+    store('sessionStorage', 'hbSession', session);
+    history.replaceState(null, '', '?code=' + room.code);
+    show('room');
+    broadcast();
+  });
+  peer.on('connection', (c) => {
+    let pid = null;
+    c.on('data', (msg) => {
+      try {
+        if (msg.t === 'hello') {
+          let p = msg.playerId && findPlayer(msg.playerId);
+          if (!p) p = addPlayer(msg.name);
+          pid = p.id;
+          const old = conns.get(pid);
+          if (old && old !== c) old.close();
+          conns.set(pid, c);
+          c.send({ t: 'welcome', playerId: pid });
+          broadcast();
+        } else if (msg.t === 'action' && pid && findPlayer(pid)) {
+          applyAction(findPlayer(pid), msg);
+        }
+      } catch (e) { c.send({ t: 'error', message: e.message }); }
+    });
+    c.on('close', () => { if (pid && conns.get(pid) === c) { conns.delete(pid); broadcast(); } });
+  });
+  peer.on('disconnected', () => { setStatusLine('Reconnecting to the internet…'); setTimeout(() => peer && !peer.destroyed && peer.reconnect(), 1500); });
+  peer.on('error', (e) => {
+    if (e.type === 'unavailable-id' && !room) {
+      peer.destroy();
+      if (isNew) { r.code = newCode(); return startHosting(r, true); }
+      if (tries < 20) { setStatusLine('Reopening your room…'); return setTimeout(() => startHosting(r, false, tries + 1), 3000); }
+      return leaveLocal('Could not reopen the room. Create a new one.');
+    }
+    if (e.type === 'peer-unavailable') return; // a guest went away
+    console.warn(e);
+    if (!room) {
+      peer.destroy();
+      $('createErr').textContent = 'Could not create room (' + (e.type || e.message) + '). Check your internet and try again.';
+      $('createBtn').disabled = false;
+    } else setStatusLine('Connection problem: ' + (e.type || e.message));
+  });
+}
+
+// Host heartbeat so guests notice a dead link quickly
+setInterval(() => { if (session?.host) for (const c of conns.values()) if (c.open) c.send({ t: 'ping' }); }, 4000);
+window.addEventListener('pagehide', () => { if (session?.host) for (const c of conns.values()) try { c.close(); } catch {} });
+
+// ---------------- Guest ----------------
+let lastHeard = Date.now();
+setInterval(() => {
+  if (!session || session.host || !peer || Date.now() - lastHeard < 10000) return;
+  lastHeard = Date.now();
+  setStatusLine('Lost the host — reconnecting…');
+  const old = hostConn; hostConn = null;
+  try { old?.close(); } catch {}
+  connectToHost(session.code, session.name, session.playerId);
+}, 2000);
+function joinRoom(code, name, playerId) {
+  if (peer) peer.destroy();
+  peer = new Peer();
+  let opened = false;
+  peer.on('open', () => connectToHost(code, name, playerId, () => (opened = true)));
+  peer.on('disconnected', () => setTimeout(() => !peer.destroyed && peer.reconnect(), 1500));
+  peer.on('error', (e) => {
+    if (e.type === 'peer-unavailable') {
+      if (session) { setStatusLine('Host is offline — retrying…'); return setTimeout(() => connectToHost(code, name, session.playerId), 3000); }
+      $('joinErr').textContent = 'No room with that code.';
+      $('joinBtn').disabled = false;
+      return;
+    }
+    console.warn(e);
+    if (!session) { $('joinErr').textContent = 'Could not connect (' + (e.type || e.message) + ').'; $('joinBtn').disabled = false; }
+  });
+}
+function connectToHost(code, name, playerId, onOpen) {
+  if (!peer || peer.destroyed) return;
+  const c = peer.connect(PEER_PREFIX + code, { reliable: true });
+  hostConn = c;
+  c.on('open', () => { onOpen && onOpen(); lastHeard = Date.now(); c.send({ t: 'hello', name, playerId }); });
+  c.on('data', (msg) => {
+    if (hostConn === c) { lastHeard = Date.now(); setStatusLine(''); }
+    if (msg.t === 'welcome') {
+      session = { code, playerId: msg.playerId, name, host: false };
+      store('sessionStorage', 'hbSession', session);
+      history.replaceState(null, '', '?code=' + code);
+      show('room');
+    } else if (msg.t === 'state') { state = msg.state; render(); }
+    else if (msg.t === 'error') alert(msg.message);
+    else if (msg.t === 'kicked') leaveLocal('You were removed from the room.');
+    else if (msg.t === 'closed') leaveLocal('The host closed the room.');
+  });
+  c.on('close', () => {
+    if (hostConn !== c || !session) return;
+    setStatusLine('Lost the host — reconnecting…');
+    setTimeout(() => hostConn === c && session && connectToHost(code, name, session.playerId), 2000);
+  });
+}
+
+// ---------------- Actions from this phone ----------------
+function act(type, extra = {}) {
+  const a = { type, ...extra };
+  if (session?.host) { try { applyAction(findPlayer(room.hostId), a); } catch (e) { alert(e.message); } }
+  else if (hostConn?.open) hostConn.send({ t: 'action', ...a });
+  else alert('Not connected to the host right now.');
+}
+
+// ---------------- Home / create / join ----------------
+const saved = load('localStorage', 'hbName') || '';
+$('joinName').value = $('hostName').value = saved;
 const urlCode = new URLSearchParams(location.search).get('code');
 if (urlCode) $('joinCode').value = urlCode.toUpperCase();
 
@@ -165,92 +365,89 @@ $('backHome').onclick = () => show('home');
 for (const name of Object.keys(PACKS)) {
   const b = document.createElement('button');
   b.textContent = '+ ' + name;
-  b.onclick = () => {
-    const cur = parseList($('words').value);
-    $('words').value = [...new Set([...cur, ...PACKS[name]])].join('\n');
-    updateCount();
-  };
+  b.onclick = () => { $('words').value = [...new Set([...parseList($('words').value), ...PACKS[name]])].join('\n'); updateCount(); };
   $('packs').appendChild(b);
 }
 const updateCount = () => { const n = parseList($('words').value).length; $('wordCount').textContent = `${n} word${n === 1 ? '' : 's'}`; };
 $('words').oninput = updateCount;
 
-$('createBtn').onclick = async () => {
+$('createBtn').onclick = () => {
   $('createErr').textContent = '';
   const name = $('hostName').value.trim();
+  const words = parseList($('words').value);
   if (!name) return ($('createErr').textContent = 'Enter your name');
-  try {
-    const r = await api('/api/create', { name, words: parseList($('words').value) });
-    save({ name });
-    enterRoom(r);
-  } catch (e) { $('createErr').textContent = e.message; }
+  if (!words.length) return ($('createErr').textContent = 'Add at least one name or word');
+  store('localStorage', 'hbName', name);
+  $('createBtn').disabled = true;
+  const hostId = rid();
+  const r = { code: newCode(), words, deck: [], status: 'lobby', hostId,
+    players: [{ id: hostId, name: clean(name, 24), score: 0, word: null, guessed: [] }] };
+  startHosting(r, true);
 };
-$('joinBtn').onclick = async () => {
+$('joinBtn').onclick = () => {
   $('joinErr').textContent = '';
   const name = $('joinName').value.trim(), code = $('joinCode').value.trim().toUpperCase();
   if (!code) return ($('joinErr').textContent = 'Enter the room code');
   if (!name) return ($('joinErr').textContent = 'Enter your name');
-  try {
-    const r = await api('/api/join', { name, code });
-    save({ name });
-    enterRoom(r);
-  } catch (e) { $('joinErr').textContent = e.message; }
+  store('localStorage', 'hbName', name);
+  $('joinBtn').disabled = true;
+  joinRoom(code, name);
 };
 
-// ---------- Room ----------
-function enterRoom({ code, playerId }) {
-  session = { code, playerId };
-  try { sessionStorage.setItem('hbSession', JSON.stringify(session)); } catch {}
-  history.replaceState(null, '', '?code=' + code);
-  show('room');
-  connect();
-}
-function connect() {
-  if (es) es.close();
-  es = new EventSource(`/api/events?code=${session.code}&playerId=${session.playerId}`);
-  es.onmessage = (e) => { state = JSON.parse(e.data); render(); };
-  es.onerror = async () => {
-    // If the room is gone (server restarted), go home
-    if (!session) return;
-    const r = await fetch(`/api/check?code=${session.code}&playerId=${session.playerId}`).catch(() => null);
-    if (r && r.status === 404) { es.close(); leaveLocal('That room no longer exists.'); }
-  };
-}
 function leaveLocal(msg) {
-  if (es) es.close();
-  session = state = null;
-  try { sessionStorage.removeItem('hbSession'); } catch {}
+  const p = peer; peer = null; hostConn = null;
+  if (p) setTimeout(() => p.destroy(), 300);
+  session = state = room = null;
+  conns.clear();
+  store('sessionStorage', 'hbSession');
+  store('localStorage', 'hbRoom');
   exitForehead();
   history.replaceState(null, '', location.pathname);
+  $('joinBtn').disabled = $('createBtn').disabled = false;
+  setStatusLine('');
   show('home');
-  if (msg) $('joinErr').textContent = msg;
+  $('joinErr').textContent = msg || '';
 }
-$('leaveBtn').onclick = async () => { if (!confirm('Leave this room?')) return; await act('leave'); leaveLocal(); };
+$('leaveBtn').onclick = () => {
+  if (session?.host) {
+    if (!confirm('You are the host. Leaving closes the room for everyone. Leave?')) return;
+    for (const c of conns.values()) if (c.open) c.send({ t: 'closed' });
+  } else {
+    if (!confirm('Leave this room?')) return;
+    if (hostConn?.open) hostConn.send({ t: 'action', type: 'leave' });
+  }
+  leaveLocal();
+};
 $('shareBtn').onclick = async () => {
-  const url = `${location.origin}/?code=${session.code}`;
+  const url = `${location.origin}${location.pathname}?code=${session.code}`;
   if (navigator.share) navigator.share({ title: 'Join my Headbands game', text: `Room code ${session.code}`, url }).catch(() => {});
-  else { await navigator.clipboard?.writeText(url); $('shareBtn').textContent = 'Link copied!'; setTimeout(() => ($('shareBtn').textContent = 'Share invite link'), 1500); }
+  else { try { await navigator.clipboard.writeText(url); } catch {} $('shareBtn').textContent = 'Link copied!'; setTimeout(() => ($('shareBtn').textContent = 'Share invite link'), 1500); }
 };
 $('startBtn').onclick = () => act('start');
 $('endBtn').onclick = () => confirm('End the game for everyone?') && act('end');
 $('lobbyBtn').onclick = () => act('lobby');
-$('addWordsBtn').onclick = async () => {
+$('addWordsBtn').onclick = () => {
   const words = parseList($('moreWords').value);
   if (!words.length) return;
-  await act('addWords', { words });
+  act('addWords', { words });
   $('moreWords').value = '';
 };
+$('players').addEventListener('click', (e) => {
+  const id = e.target.dataset?.kick;
+  if (id && confirm('Remove this player?')) act('kick', { playerId: id });
+});
 
 function render() {
   if (!state) return;
   const me = state.players.find((p) => p.id === state.you);
-  if (!me) return leaveLocal('You were removed from the room.');
+  if (!me) return;
   const isHost = state.hostId === state.you;
   const playing = state.status === 'playing';
   $('roomCode').textContent = state.code;
   $('roomStatus').textContent =
     state.status === 'lobby' ? `Waiting for players · ${state.totalWords} words ready` :
     playing ? `Game on · ${state.wordsLeft} words left in the pile` : 'Game over';
+  $('hostNote').classList.toggle('hidden', !isHost);
   $('playPanel').classList.toggle('hidden', !playing);
   $('hostPanel').classList.toggle('hidden', !isHost);
   $('startBtn').classList.toggle('hidden', playing);
@@ -264,9 +461,10 @@ function render() {
     const self = p.id === state.you;
     let right = '';
     if (playing) right = self ? '<span class="you">??? (that\'s you)</span>' : `<span class="word">${esc(p.word || '— out of words —')}</span>`;
-    const score = state.status !== 'lobby' ? `<span class="score">${p.score}</span>` : (p.id === state.hostId ? '<span class="muted">host</span>' : '');
+    let side = state.status !== 'lobby' ? `<span class="score">${p.score}</span>` : (p.id === state.hostId ? '<span class="muted">host</span>' : '');
+    if (isHost && !self && !p.online) side += ` <button class="small ghost" data-kick="${esc(p.id)}">Remove</button>`;
     return `<li><div><span class="dot ${p.online ? '' : 'off'}"></span>${esc(p.name)}${self ? ' (you)' : ''}
-      ${playing ? '<br>' + right : ''}</div>${score}</li>`;
+      ${playing ? '<br>' + right : ''}</div><div>${side}</div></li>`;
   }).join('');
 
   const res = $('results');
@@ -281,11 +479,11 @@ function render() {
   else if (fh.on) updateForehead(me);
 }
 
-// ---------- Forehead mode ----------
-const fh = { on: false, busy: false, baseline: null, armed: true, lastWord: null };
+// ---------------- Forehead mode ----------------
+const fh = { on: false, busy: false, baseline: null, armed: true };
+const myWord = () => state?.players.find((p) => p.id === state.you)?.word;
 
 $('foreheadBtn').onclick = async () => {
-  // iOS needs permission for motion sensors
   try {
     if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
       await DeviceOrientationEvent.requestPermission();
@@ -307,69 +505,59 @@ function exitForehead() {
   try { fh.wake?.release(); } catch {}
   if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
 }
-
 function countdown() {
   fh.busy = true;
   let n = 3;
-  const el = $('fhWord');
   const tick = () => {
     if (!fh.on) return;
-    if (n > 0) { el.textContent = n === 3 ? 'Phone on forehead! 3' : n; n--; setTimeout(tick, 900); }
-    else { fh.busy = false; fh.baseline = null; fh.armed = true; updateForehead(state.players.find((p) => p.id === state.you)); }
+    if (n > 0) { $('fhWord').textContent = n === 3 ? 'Phone on forehead! 3' : n; n--; setTimeout(tick, 900); }
+    else { fh.busy = false; fh.baseline = null; fh.armed = true; updateForehead(); }
   };
   tick();
 }
+function updateForehead() { if (!fh.busy) $('fhWord').textContent = myWord() || 'Out of words!'; }
 
-function updateForehead(me) {
-  if (fh.busy) return;
-  $('fhWord').textContent = me?.word || 'Out of words!';
-}
-
-async function answer(type) {
-  if (!fh.on || fh.busy) return;
-  const me = state.players.find((p) => p.id === state.you);
-  if (!me?.word) return;
+function answer(type) {
+  if (!fh.on || fh.busy || !myWord()) return;
   fh.busy = true;
   const box = $('forehead');
   box.classList.add(type === 'correct' ? 'good' : 'bad');
   $('fhWord').textContent = type === 'correct' ? 'Correct!' : 'Pass';
   if (navigator.vibrate) navigator.vibrate(type === 'correct' ? 120 : [60, 60, 60]);
-  await act(type);
-  setTimeout(() => {
-    box.classList.remove('good', 'bad');
-    fh.busy = false;
-    updateForehead(state.players.find((p) => p.id === state.you));
-  }, 1200);
+  act(type);
+  setTimeout(() => { box.classList.remove('good', 'bad'); fh.busy = false; updateForehead(); }, 1200);
 }
-
 $('fhZones').addEventListener('click', (e) => {
   const rect = e.currentTarget.getBoundingClientRect();
   answer(e.clientX > rect.left + rect.width / 2 ? 'correct' : 'pass');
 });
-
-// Tilt detection: phone held sideways on the forehead, screen facing out.
-// Tilting the head down (screen toward floor) = correct, up (toward ceiling) = pass.
+// Phone held sideways on the forehead, screen facing out.
+// Tilt head down (screen toward floor) = correct, up (toward ceiling) = pass.
 window.addEventListener('deviceorientation', (e) => {
   if (!fh.on || fh.busy || e.beta == null) return;
   const angle = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
   const landscape = Math.abs(angle) === 90 || angle === 270;
-  // In landscape, forward/back tilt of the head shows up on gamma; in portrait on beta.
   let v = landscape ? e.gamma : e.beta;
   if (angle === 90) v = -v;
   if (fh.baseline == null) { fh.baseline = v; return; }
   let d = v - fh.baseline;
-  // gamma wraps at ±90 when the phone passes vertical; unwrap
   if (landscape) { if (d > 90) d -= 180; if (d < -90) d += 180; }
   if (!fh.armed) { if (Math.abs(d) < 15) fh.armed = true; return; }
   if (d > 40) { fh.armed = false; answer('correct'); }
   else if (d < -40) { fh.armed = false; answer('pass'); }
 });
 
-// Resume a session after a page refresh
-try {
-  const s = JSON.parse(sessionStorage.getItem('hbSession') || 'null');
-  if (s) enterRoom(s);
-} catch {}
+// ---------------- Resume after a refresh ----------------
+(() => {
+  const s = load('sessionStorage', 'hbSession');
+  if (!s) return;
+  if (s.host) {
+    const r = load('localStorage', 'hbRoom');
+    if (r && r.code === s.code) { setStatusLine('Reopening your room…'); startHosting(r, false); }
+  } else {
+    session = s; show('room'); setStatusLine('Reconnecting…'); joinRoom(s.code, s.name, s.playerId);
+  }
+})();
 </script>
 </body>
 </html>
