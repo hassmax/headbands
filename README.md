@@ -6,13 +6,13 @@ A party game for phones. Each player holds their phone up to their forehead, sho
 
 1. **Host:** tap **Create a new room**, enter your name, and type a list of names or words (one per line or comma-separated). You can also add starter packs (Celebrities, Historical, Characters, (In)famous, Animals, Things). You get a 4-letter room code.
 2. **Everyone else:** open the site, enter the room code and your name, and tap **Join**. The host can also tap **Share invite link**.
-3. The host taps **Start game**. Every player gets a random word from the list.
-4. Tap **Put it on my forehead**. After a 3-second countdown your word is shown big. Hold the phone to your forehead with the screen facing out.
-5. When you guess right, **tilt down** or **tap the right side**. To skip, **tilt up** or **tap the left side**. You then get a new word. Skipped words go back into the pile.
-6. Off your forehead, the room screen shows what everyone else is so you can give them clues. Your own word shows as `???`.
-7. The host taps **End game** to show the scoreboard and what each person guessed. They can then play again or go back to the lobby.
+3. The host taps **Start game**. Every player gets **one** random name from the list, and it stays the same for the whole game.
+4. Tap **Put it on my forehead**. After a 3-second countdown your name fills the screen. Hold the phone to your forehead with the screen facing out.
+5. Take turns asking yes/no questions. When the others say you've got it, tap **I guessed it!**. Your name is revealed and you get a place (1st, 2nd…). Stuck? Tap **Give up**.
+6. Off your forehead, the room screen shows everyone else's name so you can answer their questions. Your own shows as `???`.
+7. The game ends when everyone has guessed or given up, or when the host taps **End game**. The host can then play again with new names.
 
-The host can add more words mid-game.
+The host can add more words mid-game, for example for late joiners.
 
 ## Play online
 
@@ -28,7 +28,7 @@ Needs Node 18 or newer. There are no dependencies.
 npm start            # http://localhost:3000
 ```
 
-Phones still need internet access to find each other. Tilt controls and full screen need HTTPS, which GitHub Pages provides; tapping works everywhere.
+Phones still need internet access to find each other. Full screen needs HTTPS, which GitHub Pages provides.
 
 ## Deploying
 

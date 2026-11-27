@@ -37,6 +37,7 @@
   .dot.off { background:#666; }
   .chips { display:flex; flex-wrap:wrap; gap:8px; }
   .chips button { width:auto; margin:0; padding:8px 12px; font-size:14px; background:#3a2766; color:var(--ink); }
+  .done { color: var(--good); font-weight: 700; }
   .score { font-weight: 800; background:#3a2766; border-radius: 999px; padding: 4px 12px; white-space: nowrap; }
   .hidden { display:none !important; }
 
@@ -46,8 +47,6 @@
   #forehead.bad { background: var(--bad); }
   #fhWord { font-size: min(18vw, 22vh); font-weight: 900; line-height: 1; padding: 0 4vw; word-break: break-word; text-shadow: 0 4px 0 rgba(0,0,0,.2); }
   #fhHint { position:absolute; bottom: 14px; left:0; right:0; font-size: 15px; opacity:.85; }
-  #fhZones { position:absolute; inset:0; display:flex; }
-  #fhZones div { flex:1; display:flex; align-items:flex-start; justify-content:center; padding-top: 14px; font-weight:800; font-size: 18px; opacity:.85; }
   #fhExit { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:2; width:auto; margin:0; padding:8px 12px; font-size:14px; background: rgba(0,0,0,.25); color:#fff; }
 </style>
 </head>
@@ -98,8 +97,15 @@
     </div>
 
     <div id="playPanel" class="hidden">
-      <button id="foreheadBtn" style="font-size:22px; padding:20px">📱 Put it on my forehead</button>
-      <p class="muted" style="text-align:center">Below: what everyone else is. Give them clues — but don't say the word!</p>
+      <div id="stillGuessing">
+        <button id="foreheadBtn" style="font-size:22px; padding:20px">📱 Put it on my forehead</button>
+        <p class="muted" style="text-align:center">Take turns asking yes/no questions about who you are. When the others say you've got it:</p>
+        <div class="row">
+          <button id="gotItBtn" style="background:var(--good)">✅ I guessed it!</button>
+          <button id="giveUpBtn" class="ghost" style="flex:0 0 32%">Give up</button>
+        </div>
+      </div>
+      <div id="youWere" class="card hidden" style="text-align:center"></div>
     </div>
 
     <div class="card">
@@ -123,9 +129,8 @@
 
 <!-- FOREHEAD MODE -->
 <div id="forehead" class="hidden">
-  <div id="fhZones"><div>◀ Pass</div><div>Got it ▶</div></div>
   <div id="fhWord"></div>
-  <div id="fhHint">Tap right = got it · left = pass · or tilt down = got it, tilt up = pass</div>
+  <div id="fhHint">Ask yes/no questions · tap Exit when you've guessed it</div>
   <button id="fhExit">✕ Exit</button>
 </div>
 
@@ -169,7 +174,7 @@ function setStatusLine(msg) { $('connStatus').textContent = msg || ''; $('connSt
 // ---------------- Host: game engine ----------------
 function draw() { return room.deck.length ? room.deck.splice(randInt(room.deck.length), 1)[0] : null; }
 function addPlayer(name, id = rid()) {
-  const p = { id, name: clean(name, 24) || 'Player', score: 0, word: null, guessed: [] };
+  const p = { id, name: clean(name, 24) || 'Player', word: null, place: null, gaveUp: false };
   room.players.push(p);
   if (room.status === 'playing') p.word = draw();
   return p;
@@ -198,15 +203,14 @@ function applyAction(player, a) {
       hostOnly();
       room.deck = [...room.words];
       room.status = 'playing';
-      for (const p of room.players) { p.score = 0; p.guessed = []; p.word = draw(); }
+      // One name per player for the whole game
+      for (const p of room.players) { p.place = null; p.gaveUp = false; p.word = draw(); }
       break;
     case 'correct':
-    case 'pass': {
-      if (room.status !== 'playing' || !player.word) break;
-      const old = player.word;
-      if (a.type === 'correct') { player.score++; player.guessed.push(old); }
-      player.word = draw();
-      if (a.type === 'pass') room.deck.push(old);
+    case 'giveup': {
+      if (room.status !== 'playing' || !player.word || player.place || player.gaveUp) break;
+      if (a.type === 'correct') player.place = room.players.filter((p) => p.place).length + 1;
+      else player.gaveUp = true;
       break;
     }
     case 'addWords':
@@ -222,7 +226,7 @@ function applyAction(player, a) {
       hostOnly();
       const p = findPlayer(a.playerId);
       if (!p || p.id === room.hostId) break;
-      if (p.word) room.deck.push(p.word);
+      if (p.word && !p.place && !p.gaveUp) room.deck.push(p.word);
       room.players = room.players.filter((x) => x !== p);
       const c = conns.get(p.id); conns.delete(p.id);
       if (c?.open) { c.send({ t: 'kicked' }); setTimeout(() => c.close(), 300); }
@@ -235,6 +239,9 @@ function applyAction(player, a) {
       break;
     default: throw new Error('Unknown action');
   }
+  // The game ends once everyone who has a name has guessed it or given up
+  if (room.status === 'playing' && room.players.some((p) => p.word) &&
+      room.players.every((p) => !p.word || p.place || p.gaveUp)) room.status = 'ended';
   broadcast();
 }
 
@@ -382,7 +389,7 @@ $('createBtn').onclick = () => {
   $('createBtn').disabled = true;
   const hostId = rid();
   const r = { code: newCode(), words, deck: [], status: 'lobby', hostId,
-    players: [{ id: hostId, name: clean(name, 24), score: 0, word: null, guessed: [] }] };
+    players: [{ id: hostId, name: clean(name, 24), word: null, place: null, gaveUp: false }] };
   startHosting(r, true);
 };
 $('joinBtn').onclick = () => {
@@ -447,7 +454,7 @@ function render() {
   $('roomCode').textContent = state.code;
   $('roomStatus').textContent =
     state.status === 'lobby' ? `Waiting for players · ${state.totalWords} words ready` :
-    playing ? `Game on · ${state.wordsLeft} words left in the pile` : 'Game over';
+    playing ? `Game on · ${state.players.filter((p) => p.place).length} of ${state.players.length} have guessed` : 'Game over';
   $('hostNote').classList.toggle('hidden', !isHost);
   $('playPanel').classList.toggle('hidden', !playing);
   $('hostPanel').classList.toggle('hidden', !isHost);
@@ -457,23 +464,35 @@ function render() {
   $('lobbyBtn').classList.toggle('hidden', state.status !== 'ended');
   $('playersTitle').textContent = playing ? 'Who is everyone?' : `Players (${state.players.length})`;
 
-  const sorted = state.status === 'lobby' ? state.players : [...state.players].sort((a, b) => b.score - a.score);
+  const finished = (p) => p.place || p.gaveUp;
+  const rank = (p) => (p.place ? p.place : p.gaveUp ? 1000 : 2000);
+  const sorted = state.status === 'lobby' ? state.players : [...state.players].sort((a, b) => rank(a) - rank(b));
+  const ord = (n) => n + (['th','st','nd','rd'][(n % 100 - 20) % 10] || ['th','st','nd','rd'][n % 100] || 'th');
+  const badge = (p) => (p.place ? `<span class="score">${p.place === 1 ? '🏆' : '✅'} ${ord(p.place)}</span>` : p.gaveUp ? '<span class="score">🏳️ gave up</span>' : '');
+
+  $('stillGuessing').classList.toggle('hidden', !!finished(me) || !me.word);
+  $('youWere').classList.toggle('hidden', !finished(me));
+  if (finished(me)) $('youWere').innerHTML = `<div class="muted">You were</div><div class="word" style="font-size:32px">${esc(me.word)}</div>` +
+    `<div class="muted">${me.place ? `Guessed it — ${ord(me.place)} place!` : 'You gave up.'} Keep giving clues to the others.</div>`;
+
   $('players').innerHTML = sorted.map((p) => {
     const self = p.id === state.you;
     let right = '';
-    if (playing) right = self ? '<span class="you">??? (that\'s you)</span>' : `<span class="word">${esc(p.word || '— out of words —')}</span>`;
-    let side = state.status !== 'lobby' ? `<span class="score">${p.score}</span>` : (p.id === state.hostId ? '<span class="muted">host</span>' : '');
+    if (state.status !== 'lobby') {
+      const hidden = self && playing && !finished(p);
+      right = hidden ? '<span class="you">??? (that\'s you)</span>' : `<span class="word">${esc(p.word || '— waiting for a name —')}</span>`;
+    }
+    let side = state.status !== 'lobby' ? badge(p) : (p.id === state.hostId ? '<span class="muted">host</span>' : '');
     if (isHost && !self && !p.online) side += ` <button class="small ghost" data-kick="${esc(p.id)}">Remove</button>`;
     return `<li><div><span class="dot ${p.online ? '' : 'off'}"></span>${esc(p.name)}${self ? ' (you)' : ''}
-      ${playing ? '<br>' + right : ''}</div><div>${side}</div></li>`;
+      ${right ? '<br>' + right : ''}</div><div>${side}</div></li>`;
   }).join('');
 
   const res = $('results');
   res.classList.toggle('hidden', state.status !== 'ended');
   if (state.status === 'ended') {
     const top = sorted[0];
-    res.innerHTML = `<h2>🏆 ${esc(top?.name)} wins with ${top?.score}!</h2>` +
-      sorted.map((p) => `<p><b>${esc(p.name)}</b> (${p.score}): <span class="muted">${p.guessed.map(esc).join(', ') || 'nothing guessed'}</span></p>`).join('');
+    res.innerHTML = top?.place === 1 ? `<h2>🏆 ${esc(top.name)} guessed first!</h2>` : '<h2>Game over</h2>';
   }
 
   if (!playing) exitForehead();
@@ -481,15 +500,10 @@ function render() {
 }
 
 // ---------------- Forehead mode ----------------
-const fh = { on: false, busy: false, baseline: null, armed: true };
+const fh = { on: false, busy: false };
 const myWord = () => state?.players.find((p) => p.id === state.you)?.word;
 
 $('foreheadBtn').onclick = async () => {
-  try {
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      await DeviceOrientationEvent.requestPermission();
-    }
-  } catch {}
   try { await document.documentElement.requestFullscreen?.(); } catch {}
   try { await screen.orientation?.lock?.('landscape'); } catch {}
   try { fh.wake = await navigator.wakeLock?.request('screen'); } catch {}
@@ -512,41 +526,14 @@ function countdown() {
   const tick = () => {
     if (!fh.on) return;
     if (n > 0) { $('fhWord').textContent = n === 3 ? 'Phone on forehead! 3' : n; n--; setTimeout(tick, 900); }
-    else { fh.busy = false; fh.baseline = null; fh.armed = true; updateForehead(); }
+    else { fh.busy = false; updateForehead(); }
   };
   tick();
 }
-function updateForehead() { if (!fh.busy) $('fhWord').textContent = myWord() || 'Out of words!'; }
-
-function answer(type) {
-  if (!fh.on || fh.busy || !myWord()) return;
-  fh.busy = true;
-  const box = $('forehead');
-  box.classList.add(type === 'correct' ? 'good' : 'bad');
-  $('fhWord').textContent = type === 'correct' ? 'Correct!' : 'Pass';
-  if (navigator.vibrate) navigator.vibrate(type === 'correct' ? 120 : [60, 60, 60]);
-  act(type);
-  setTimeout(() => { box.classList.remove('good', 'bad'); fh.busy = false; updateForehead(); }, 1200);
-}
-$('fhZones').addEventListener('click', (e) => {
-  const rect = e.currentTarget.getBoundingClientRect();
-  answer(e.clientX > rect.left + rect.width / 2 ? 'correct' : 'pass');
-});
-// Phone held sideways on the forehead, screen facing out.
-// Tilt head down (screen toward floor) = correct, up (toward ceiling) = pass.
-window.addEventListener('deviceorientation', (e) => {
-  if (!fh.on || fh.busy || e.beta == null) return;
-  const angle = (screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0;
-  const landscape = Math.abs(angle) === 90 || angle === 270;
-  let v = landscape ? e.gamma : e.beta;
-  if (angle === 90) v = -v;
-  if (fh.baseline == null) { fh.baseline = v; return; }
-  let d = v - fh.baseline;
-  if (landscape) { if (d > 90) d -= 180; if (d < -90) d += 180; }
-  if (!fh.armed) { if (Math.abs(d) < 15) fh.armed = true; return; }
-  if (d > 40) { fh.armed = false; answer('correct'); }
-  else if (d < -40) { fh.armed = false; answer('pass'); }
-});
+function updateForehead() { if (!fh.busy) $('fhWord').textContent = myWord() || 'Waiting for a name…'; }
+$('forehead').addEventListener('click', (e) => { if (e.target.id !== 'fhExit') $('fhHint').classList.toggle('hidden'); });
+$('gotItBtn').onclick = () => confirm('Did you guess it? This reveals your name to you.') && act('correct');
+$('giveUpBtn').onclick = () => confirm('Give up and see who you are?') && act('giveup');
 
 // ---------------- Resume after a refresh ----------------
 (() => {
