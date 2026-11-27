@@ -4,7 +4,7 @@ A party game for phones. Each player holds their phone up to their forehead, sho
 
 ## How to play
 
-1. **Host:** tap **Create a new room**, enter your name, and type a list of names or words (one per line or comma-separated). You can also add starter packs (Celebrities, Historical, Characters, Animals, Things). You get a 4-letter room code.
+1. **Host:** tap **Create a new room**, enter your name, and type a list of names or words (one per line or comma-separated). You can also add starter packs (Celebrities, Historical, Characters, (In)famous, Animals, Things). You get a 4-letter room code.
 2. **Everyone else:** open the site, enter the room code and your name, and tap **Join**. The host can also tap **Share invite link**.
 3. The host taps **Start game**. Every player gets a random word from the list.
 4. Tap **Put it on my forehead**. After a 3-second countdown your word is shown big. Hold the phone to your forehead with the screen facing out.
